@@ -1,1 +1,16 @@
-{}
+{
+  "repository": "evilsaloon/kodi-source",
+  "upstream_url": "https://mirrors.kodi.tv/releases/darwin/ios-arm64/org.xbmc.kodi-ios_21.3_iphoneos-arm64.deb?https=1",
+  "upstream_package_sha256": "c80e2e4eded0b3be9f9c8cd19a73e3f3ac7171575dd6f08cfddf14312ca81eb8",
+  "upstream_title": "Kodi v21.3 (Omega)",
+  "bundle_identifier": "org.xbmc.kodi-ios",
+  "version": "21.3",
+  "build_version": "20251031-a3a448d26b",
+  "minimum_ios": "11.0",
+  "tag": "kodi-21.3-20251031-a3a448d26b",
+  "ipa_sha256": "54717e860db47fb35a9082da717eb82424dfd446c8e29101f4ae1ec39aa932d0",
+  "ipa_size": 213236675,
+  "source_archive_url": "https://github.com/xbmc/xbmc/archive/refs/tags/21.3-Omega.tar.gz",
+  "source_archive_sha256": "a60afcb556e4a00cb19fc35b7e77758107c9a8096c6ce9b66af5f92396be31aa",
+  "packaging": "Official Kodi.app preserved and wrapped in Payload; no code signing performed."
+}

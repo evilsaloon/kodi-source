@@ -1,10 +1,50 @@
 {
   "name": "Kodi Stable (Unofficial)",
   "identifier": "evilsaloon.kodi-source.kodi-stable",
-  "subtitle": "Official Kodi stable builds, repackaged for SideStore",
-  "description": "An independent personal source for Kodi's official Recommended iOS release. SideStore signs the app using your developer account. The first manual updater run will populate this catalog.",
+  "subtitle": "Official Kodi releases, prepared for SideStore",
+  "description": "An independent source that follows Kodi's recommended stable iOS release.",
   "website": "https://github.com/evilsaloon/kodi-source",
-  "iconURL": "https://raw.githubusercontent.com/evilsaloon/kodi-source/main/assets/icon.png",
-  "apps": [],
+  "apps": [
+    {
+      "name": "Kodi",
+      "bundleIdentifier": "org.xbmc.kodi-ios",
+      "developerName": "Kodi Foundation",
+      "subtitle": "Official stable Kodi, repackaged for personal signing",
+      "localizedDescription": "The official stable Kodi iOS app, repackaged as an unsigned IPA. This independently maintained source is not operated by the Kodi Foundation.",
+      "iconURL": "https://raw.githubusercontent.com/evilsaloon/kodi-source/main/assets/icon.png",
+      "tintColor": "17B2E7",
+      "category": "entertainment",
+      "versions": [
+        {
+          "version": "21.3",
+          "buildVersion": "20251031-a3a448d26b",
+          "date": "2026-10-25T03:10:35+00:00",
+          "localizedDescription": "Repackaged from Kodi v21.3 (Omega). Official package: https://mirrors.kodi.tv/releases/darwin/ios-arm64/org.xbmc.kodi-ios_21.3_iphoneos-arm64.deb?https=1",
+          "downloadURL": "https://github.com/evilsaloon/kodi-source/releases/download/kodi-21.3-20251031-a3a448d26b/Kodi-21.3-20251031-a3a448d26b.ipa",
+          "size": 213236675,
+          "minOSVersion": "11.0"
+        }
+      ],
+      "appPermissions": {
+        "entitlements": [
+          "com.apple.CommCenter.fine-grained",
+          "com.apple.coreaudio.allow-amr-decode",
+          "com.apple.coremedia.allow-protected-content-playback",
+          "com.apple.managedconfiguration.profiled-access",
+          "com.apple.private.security.no-container",
+          "com.apple.private.skip-library-validation",
+          "com.apple.security.iokit-user-client-class",
+          "com.apple.springboard.launchapplications",
+          "com.apple.springboard.opensensitiveurl",
+          "keychain-access-groups",
+          "platform-application"
+        ],
+        "privacy": {
+          "NSMicrophoneUsageDescription": "Used for speech recognition",
+          "NSSpeechRecognitionUsageDescription": "Translate speech to text in virtual keyboard dialog"
+        }
+      }
+    }
+  ],
   "news": []
 }
