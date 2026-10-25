@@ -1,0 +1,10 @@
+{
+  "name": "Kodi Stable (Unofficial)",
+  "identifier": "evilsaloon.kodi-source.kodi-stable",
+  "subtitle": "Official Kodi stable builds, repackaged for SideStore",
+  "description": "An independent personal source for Kodi's official Recommended iOS release. SideStore signs the app using your developer account. The first manual updater run will populate this catalog.",
+  "website": "https://github.com/evilsaloon/kodi-source",
+  "iconURL": "https://raw.githubusercontent.com/evilsaloon/kodi-source/main/assets/icon.png",
+  "apps": [],
+  "news": []
+}

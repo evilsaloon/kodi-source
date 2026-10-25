@@ -1,0 +1,197 @@
+name: Update Kodi source
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Recheck and rebuild the current upstream package
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: '23 7 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kodi-source-publisher
+  cancel-in-progress: false
+
+jobs:
+  update:
+    # Manual runs always work. Enable the repository variable after testing.
+    if: github.event_name == 'workflow_dispatch' || vars.AUTO_UPDATE_ENABLED == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      FORCE_REBUILD: ${{ inputs.force || false }}
+    steps:
+      - name: Check out the default branch
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies and run tests
+        run: |
+          python -m pip install --disable-pip-version-check --requirement requirements.txt
+          python -m unittest discover -s tests -v
+
+      - name: Check the stable release and prepare an IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          extra_args=()
+          if [[ "$FORCE_REBUILD" == "true" ]]; then
+            extra_args+=(--force)
+          fi
+          python scripts/update.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --output-dir build \
+            --existing-source source.json \
+            --state state.json \
+            "${extra_args[@]}"
+
+      - name: Publish release assets before changing the feed
+        shell: python
+        run: |
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          root = Path.cwd().resolve()
+          manifest = json.loads(Path("build/manifest.json").read_text())
+          if not manifest["changed"]:
+              print("The stable release is already published.")
+              raise SystemExit(0)
+
+          def run(*args):
+              return subprocess.run(args, check=True, text=True, capture_output=True).stdout
+
+          def local_path(value):
+              path = (root / value).resolve()
+              if not path.is_relative_to(root / "build") or not path.is_file():
+                  raise RuntimeError(f"Unexpected release asset path: {value}")
+              return path
+
+          tag = manifest["tag"]
+          names = manifest.get("assets", [manifest["ipa_path"]])
+          for key in ("provenance_path",):
+              if manifest.get(key) and manifest[key] not in names:
+                  names.append(manifest[key])
+          assets = [local_path(name) for name in names]
+          if len({path.name for path in assets}) != len(assets):
+              raise RuntimeError("Release assets must have unique filenames.")
+
+          # Authenticated release listing includes drafts, whereas lookup by
+          # /releases/tags/{tag} cannot reliably find a draft's pending tag.
+          # Let API/auth/network errors fail instead of treating them as absence.
+          pages = json.loads(run(
+              "gh", "api", "--paginate", "--slurp",
+              f"repos/{os.environ['GITHUB_REPOSITORY']}/releases?per_page=100",
+          ))
+          release = next((item for page in pages for item in page if item["tag_name"] == tag), None)
+          if release is None:
+              command = [
+                  "gh", "release", "create", tag, "--draft",
+                  "--target", run("git", "rev-parse", "HEAD").strip(),
+                  "--title", manifest.get("release_name", f"Kodi {manifest['version']}"),
+              ]
+              if manifest.get("release_notes_path"):
+                  command += ["--notes-file", str(local_path(manifest["release_notes_path"]))]
+              else:
+                  command += ["--notes", "Repackaged official Kodi iOS stable build. SideStore signs on-device."]
+              run(*command)
+              # The CLI resolves draft releases through its GraphQL path.
+              identity = json.loads(run("gh", "release", "view", tag, "--json", "databaseId"))
+              release = json.loads(run(
+                  "gh", "api", f"repos/{os.environ['GITHUB_REPOSITORY']}/releases/{identity['databaseId']}"
+              ))
+
+          remote_assets = {asset["name"]: asset for asset in release["assets"]}
+          for asset in assets:
+              with asset.open("rb") as stream:
+                  expected = "sha256:" + hashlib.file_digest(stream, "sha256").hexdigest()
+              existing = remote_assets.get(asset.name)
+              if existing:
+                  digest = existing.get("digest")
+                  if digest:
+                      matches = digest == expected
+                  else:
+                      # Older GitHub assets may not have the digest API field.
+                      result = subprocess.run([
+                          "gh", "api", "--header", "Accept: application/octet-stream",
+                          f"repos/{os.environ['GITHUB_REPOSITORY']}/releases/assets/{existing['id']}",
+                      ], check=True, capture_output=True)
+                      matches = "sha256:" + hashlib.sha256(result.stdout).hexdigest() == expected
+                  if not matches or existing["size"] != asset.stat().st_size:
+                      raise RuntimeError(f"Existing release asset differs: {asset.name}. Refusing to replace it.")
+                  print(f"Verified existing asset: {asset.name}")
+              else:
+                  if not release["draft"]:
+                      raise RuntimeError(f"Published release is missing {asset.name}; inspect it before retrying.")
+                  run("gh", "release", "upload", tag, str(asset))
+                  print(f"Uploaded {asset.name}")
+          if release["draft"]:
+              run("gh", "release", "edit", tag, "--draft=false", "--latest")
+
+      - name: Commit the feed and successful-check record
+        shell: python
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          import datetime
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+
+          manifest = json.loads(Path("build/manifest.json").read_text())
+          tracked = []
+          if manifest["changed"]:
+              for key, destination in (("source_path", "source.json"), ("state_path", "state.json")):
+                  source = Path(manifest.get(key, "build/" + destination))
+                  if not source.is_file() or not source.resolve().is_relative_to(Path("build").resolve()):
+                      raise RuntimeError(f"Missing or unexpected generated file: {source}")
+                  shutil.copyfile(source, destination)
+                  tracked.append(destination)
+
+          # A real monthly status commit keeps this infrequently updated public
+          # repository active between Kodi releases. Failed checks never write it.
+          now = datetime.datetime.now(datetime.timezone.utc)
+          status_path = Path("status.json")
+          previous = json.loads(status_path.read_text()) if status_path.exists() else {}
+          if previous.get("lastSuccessfulCheckMonth") != now.strftime("%Y-%m"):
+              status_path.write_text(json.dumps({
+                  "lastSuccessfulCheckMonth": now.strftime("%Y-%m"),
+                  "lastSuccessfulCheck": now.isoformat(),
+              }, indent=2) + "\n")
+              tracked.append(str(status_path))
+
+          if tracked:
+              subprocess.run(["git", "add", "--", *tracked], check=True)
+              if subprocess.run(["git", "diff", "--cached", "--quiet"]).returncode:
+                  subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=True)
+                  subprocess.run(["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"], check=True)
+                  message = f"Publish Kodi {manifest['version']} source" if manifest["changed"] else "Record successful Kodi stable-release check"
+                  subprocess.run(["git", "commit", "-m", message], check=True)
+                  # No force push: a conflicting human change must be reviewed.
+                  subprocess.run(["git", "push", "origin", "HEAD:" + os.environ["DEFAULT_BRANCH"]], check=True)
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              if manifest["changed"]:
+                  summary.write(f"Published Kodi {manifest['version']} ({manifest['build_version']}).\n\n")
+              else:
+                  summary.write("No new recommended Kodi iOS release.\n\n")
+              summary.write(f"Source: https://raw.githubusercontent.com/{os.environ['GITHUB_REPOSITORY']}/{os.environ['DEFAULT_BRANCH']}/source.json\n")
