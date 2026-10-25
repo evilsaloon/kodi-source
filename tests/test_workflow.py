@@ -1,4 +1,4 @@
-"""Exercise the actual workflow shell block with macOS's system Bash."""
+"""Exercise the actual workflow shell block with the host's system Bash."""
 
 import os
 from pathlib import Path

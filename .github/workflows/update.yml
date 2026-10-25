@@ -22,7 +22,7 @@ jobs:
   update:
     # Manual runs always work. Enable the repository variable after testing.
     if: github.event_name == 'workflow_dispatch' || vars.AUTO_UPDATE_ENABLED == 'true'
-    runs-on: macos-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
       GH_TOKEN: ${{ github.token }}

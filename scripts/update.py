@@ -8,11 +8,13 @@ the immutable assets first, then commits the prepared feed and state together.
 import argparse
 import hashlib
 import json
+import mmap
 import os
 import plistlib
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import tarfile
 import tempfile
@@ -248,26 +250,148 @@ def bundle_metadata(app):
     return info
 
 
-def read_entitlements(bundle):
-    try:
-        result = subprocess.run(["codesign", "-d", "--entitlements", ":-", str(bundle)], capture_output=True)
-    except FileNotFoundError as exc:
-        raise UpdateError("codesign is required to inspect app entitlements; run the updater on macOS") from exc
-    if result.returncode:
-        if (b"code object is not signed at all" in result.stderr
-                or re.search(rb"(?m)^.*: no signature\s*$", result.stderr)):
-            return {}
-        raise UpdateError("Could not inspect entitlements: " + result.stderr.decode(errors="replace"))
-    output = result.stdout.strip()
-    if not output:
+def signature_entitlements(data, offset, size):
+    """Read declared XML entitlements, not cryptographically verify a signature.
+
+    Layout/constants: Apple's xnu osfmk/kern/cs_blobs.h. All signature blob
+    integers are big-endian, independent of the containing Mach-O byte order.
+    """
+    if size < 12 or size > 64 * 1024 * 1024:
+        raise UpdateError("Invalid embedded code-signature size")
+    magic, length, count = struct.unpack_from(">III", data, offset)
+    table_end = 12 + count * 8
+    if magic != 0xFADE0CC0 or length > size or length < table_end or count > 4096:
+        raise UpdateError("Malformed embedded code-signature superblob")
+    slots = set()
+    ranges = []
+    xml = None
+    has_der = False
+    for index in range(count):
+        slot, relative = struct.unpack_from(">II", data, offset + 12 + index * 8)
+        if slot in slots or relative < table_end or relative + 8 > length:
+            raise UpdateError("Invalid or duplicate code-signature slot")
+        slots.add(slot)
+        blob_magic, blob_length = struct.unpack_from(">II", data, offset + relative)
+        if blob_length < 8 or relative + blob_length > length:
+            raise UpdateError("Code-signature blob extends outside its superblob")
+        ranges.append((relative, relative + blob_length))
+        if slot == 5:
+            if blob_magic != 0xFADE7171 or blob_length > 1024 * 1024:
+                raise UpdateError("Malformed or oversized XML entitlement blob")
+            xml = bytes(data[offset + relative + 8:offset + relative + blob_length])
+        elif slot == 7:
+            if blob_magic != 0xFADE7172:
+                raise UpdateError("Malformed DER entitlement blob")
+            has_der = True
+        elif blob_magic in (0xFADE7171, 0xFADE7172):
+            raise UpdateError("Entitlement blob is stored in an unexpected signature slot")
+    ranges.sort()
+    if any(left[1] > right[0] for left, right in zip(ranges, ranges[1:])):
+        raise UpdateError("Overlapping embedded code-signature blobs")
+    if xml is None:
+        if has_der:
+            raise UpdateError("DER-only entitlements are unsupported; refusing to omit app permissions")
         return {}
+    if not xml.lstrip(b"\xef\xbb\xbf \t\r\n").startswith((b"<?xml", b"<plist")):
+        raise UpdateError("XML entitlement slot does not contain an XML plist")
     try:
-        entitlements = plistlib.loads(output)
+        entitlements = plistlib.loads(xml)
     except Exception as exc:
-        raise UpdateError("codesign returned invalid entitlements") from exc
-    if not isinstance(entitlements, dict):
-        raise UpdateError("App entitlements were not a dictionary")
+        raise UpdateError("Invalid XML entitlement plist") from exc
+    if not isinstance(entitlements, dict) or not all(isinstance(key, str) for key in entitlements):
+        raise UpdateError("App entitlements were not a string-keyed dictionary")
     return entitlements
+
+
+def macho_entitlements(data):
+    """Extract entitlement dictionaries from bounded thin/fat Mach-O slices.
+
+    This inspects metadata only: it does not validate CodeDirectory hashes, CMS
+    signatures, or the equivalence of an optional DER copy to the XML copy.
+    A missing LC_CODE_SIGNATURE is unsigned; arbitrary XML elsewhere is ignored.
+    """
+    thin_formats = {b"\xce\xfa\xed\xfe": ("<", 28), b"\xfe\xed\xfa\xce": (">", 28),
+                    b"\xcf\xfa\xed\xfe": ("<", 32), b"\xfe\xed\xfa\xcf": (">", 32)}
+    fat_formats = {b"\xca\xfe\xba\xbe": (">", False), b"\xbe\xba\xfe\xca": ("<", False),
+                   b"\xca\xfe\xba\xbf": (">", True), b"\xbf\xba\xfe\xca": ("<", True)}
+
+    def thin(start, size):
+        if size < 4 or bytes(data[start:start + 4]) not in thin_formats:
+            raise UpdateError("Unsupported executable format; expected a Mach-O slice")
+        endian, header_size = thin_formats[bytes(data[start:start + 4])]
+        if size < header_size:
+            raise UpdateError("Truncated Mach-O header")
+        ncmds, command_bytes = struct.unpack_from(endian + "II", data, start + 16)
+        if ncmds > 65536 or command_bytes > size - header_size or command_bytes < ncmds * 8:
+            raise UpdateError("Invalid Mach-O load-command bounds")
+        cursor = start + header_size
+        command_end = cursor + command_bytes
+        signature = None
+        for _ in range(ncmds):
+            if cursor + 8 > command_end:
+                raise UpdateError("Truncated Mach-O load command")
+            command, command_size = struct.unpack_from(endian + "II", data, cursor)
+            if command_size < 8 or command_size % 4 or cursor + command_size > command_end:
+                raise UpdateError("Invalid Mach-O load-command size")
+            if command == 0x1D:  # LC_CODE_SIGNATURE / linkedit_data_command
+                if command_size != 16 or signature is not None:
+                    raise UpdateError("Invalid or duplicate LC_CODE_SIGNATURE")
+                relative, signature_size = struct.unpack_from(endian + "II", data, cursor + 8)
+                if relative < header_size + command_bytes or relative + signature_size > size:
+                    raise UpdateError("Code-signature range is outside its Mach-O slice")
+                signature = (start + relative, signature_size)
+            cursor += command_size
+        if cursor != command_end:
+            raise UpdateError("Mach-O load-command sizes do not match its header")
+        return signature_entitlements(data, *signature) if signature else {}
+
+    if len(data) < 4:
+        raise UpdateError("Truncated executable")
+    magic = bytes(data[:4])
+    if magic not in fat_formats:
+        return thin(0, len(data))
+    if len(data) < 8:
+        raise UpdateError("Truncated fat Mach-O header")
+    endian, is_64 = fat_formats[magic]
+    count = struct.unpack_from(endian + "I", data, 4)[0]
+    entry_size = 32 if is_64 else 20
+    table_end = 8 + count * entry_size
+    if not 1 <= count <= 128 or table_end > len(data):
+        raise UpdateError("Invalid fat Mach-O architecture table")
+    slices = []
+    for index in range(count):
+        cursor = 8 + index * entry_size
+        if is_64:
+            start, size, alignment = struct.unpack_from(endian + "QQI", data, cursor + 8)
+        else:
+            start, size, alignment = struct.unpack_from(endian + "III", data, cursor + 8)
+        if (start < table_end or size < 4 or start + size > len(data)
+                or alignment > 63 or start % (1 << alignment)):
+            raise UpdateError("Invalid fat Mach-O slice bounds or alignment")
+        slices.append((start, size))
+    ordered = sorted(slices)
+    if any(start + size > next_start for (start, size), (next_start, _) in zip(ordered, ordered[1:])):
+        raise UpdateError("Overlapping fat Mach-O slices")
+    combined = {}
+    for start, size in slices:
+        for key, value in thin(start, size).items():
+            if key in combined and combined[key] != value:
+                raise UpdateError("Conflicting entitlements between Mach-O architectures: " + key)
+            combined[key] = value
+    return combined
+
+
+def read_entitlements(bundle):
+    info = read_plist(bundle / "Info.plist")
+    executable = info.get("CFBundleExecutable")
+    if not isinstance(executable, str) or len(safe_path(executable).parts) != 1:
+        raise UpdateError("Missing or invalid executable name in app bundle")
+    executable = bundle / executable
+    with executable.open("rb") as handle:
+        if os.fstat(handle.fileno()).st_size < 4:
+            raise UpdateError("Truncated app executable")
+        with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as data:
+            return macho_entitlements(data)
 
 
 def app_permissions(app):

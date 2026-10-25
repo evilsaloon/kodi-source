@@ -32,7 +32,7 @@ It does not pick the newest file in the mirror directory, where stable releases,
 
 ## What gets published
 
-The updater extracts `Kodi.app` from Kodi's official `.deb`, preserves permissions and symbolic links, and puts the app under `Payload/` in a ZIP archive named `.ipa`. It reads the bundle identifier, application version, build version, supported iOS version, and permission metadata from the actual app rather than guessing them from the filename.
+The updater extracts `Kodi.app` from Kodi's official `.deb`, preserves permissions and symbolic links, and puts the app under `Payload/` in a ZIP archive named `.ipa`. It reads the bundle identifier, application version, build version, supported iOS version, and permission metadata from the actual app rather than guessing them from the filename. The workflow runs on Ubuntu 24.04; a portable Mach-O reader inspects embedded entitlements, so Xcode and macOS signing tools are unnecessary.
 
 Each release has version-specific asset URLs. The workflow uploads and publishes the release before committing the new `source.json` and state. A network or packaging failure cannot replace the feed with an incomplete build. Existing assets are checked by SHA-256 and are never silently overwritten. Older published releases remain available even when the feed retains only recent version entries.
 
@@ -41,13 +41,13 @@ Keep the same signed bundle identifier and developer team when updating an exist
 ## Maintenance
 
 - GitHub can disable public-repository schedules after 60 days without repository activity. This workflow makes a monthly commit recording a successful upstream check in `status.json`, so the repository remains active between Kodi releases. A failing check cannot advance that record. If a schedule becomes disabled, re-enable it in Actions and investigate failed runs.
-- The **force** option rebuilds an already known package for diagnostics. Deterministic packaging means the existing versioned IPA should have the same digest. A mismatch deliberately stops publication; inspect the reason instead of deleting a release to bypass it.
+- The **force** option rebuilds an already known package for diagnostics. Packaging preserves stable ordering and metadata, but changing Python or compression-library versions can change compressed bytes. A digest mismatch deliberately stops publication; inspect the reason instead of deleting a release to bypass it.
 - Check Actions failure notifications. An upstream layout or permissions change can require an updater change before a release is publishable.
 - To pause automatic checks, set `AUTO_UPDATE_ENABLED` to `false` or disable the workflow. Apps already installed on your phone continue working until their signing/profile validity expires.
 
 ## Local checks
 
-On macOS, with Python 3.12 or newer:
+On Linux or macOS, with Python 3.12 or newer and `ar` available (`binutils` on Ubuntu):
 
 ```bash
 python3 -m venv .venv

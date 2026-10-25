@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import plistlib
 import stat
+import struct
 import tarfile
 import tempfile
 import unittest
@@ -40,6 +41,42 @@ def make_tar(path, entries):
             else:
                 member.size = len(value)
                 archive.addfile(member, io.BytesIO(value))
+
+
+def signature_fixture(slots):
+    header_size = 12 + 8 * len(slots)
+    index = bytearray()
+    payload = bytearray()
+    for slot, magic, content in slots:
+        index.extend(struct.pack(">II", slot, header_size + len(payload)))
+        payload.extend(struct.pack(">II", magic, 8 + len(content)) + content)
+    return struct.pack(">III", 0xFADE0CC0, header_size + len(payload), len(slots)) + index + payload
+
+
+def thin_fixture(entitlements=None, signature=None, endian="<", is_64=True):
+    if entitlements is not None:
+        signature = signature_fixture([(5, 0xFADE7171, plistlib.dumps(entitlements))])
+    header_size = 32 if is_64 else 28
+    fields = [0xFEEDFACF if is_64 else 0xFEEDFACE, 0x100000C, 0, 2,
+              1 if signature is not None else 0, 16 if signature is not None else 0, 0]
+    if is_64:
+        fields.append(0)
+    header = struct.pack(endian + "I" * len(fields), *fields)
+    if signature is None:
+        return header
+    return header + struct.pack(endian + "IIII", 0x1D, 16, header_size + 16, len(signature)) + signature
+
+
+def fat_fixture(slices, is_64=False):
+    offset = 8 + (32 if is_64 else 20) * len(slices)
+    entries = bytearray()
+    for index, binary in enumerate(slices):
+        if is_64:
+            entries.extend(struct.pack(">IIQQII", index, 0, offset, len(binary), 0, 0))
+        else:
+            entries.extend(struct.pack(">IIIII", index, 0, offset, len(binary), 0))
+        offset += len(binary)
+    return struct.pack(">II", 0xCAFEBABF if is_64 else 0xCAFEBABE, len(slices)) + entries + b"".join(slices)
 
 
 class MetadataTests(unittest.TestCase):
@@ -139,14 +176,62 @@ class PackageTests(unittest.TestCase):
         (app / "Kodi").chmod(0o755)
         self.assertEqual(update.bundle_metadata(app)["CFBundleVersion"], "20251031-a3a448d26b")
 
-    def test_no_signature_warning_is_unsigned_but_other_codesign_failures_raise(self):
-        no_signature = mock.Mock(returncode=1, stdout=b"", stderr=b"Kodi.app: no signature\nwarning: invalid entitlements blob\n")
-        with mock.patch.object(update.subprocess, "run", return_value=no_signature):
-            self.assertEqual(update.read_entitlements(Path("Kodi.app")), {})
-        bad_signature = mock.Mock(returncode=1, stdout=b"", stderr=b"invalid or unsupported format for signature\n")
-        with mock.patch.object(update.subprocess, "run", return_value=bad_signature):
+
+class MachOTests(unittest.TestCase):
+    def test_unsigned_does_not_scan_unreferenced_xml(self):
+        binary = thin_fixture() + plistlib.dumps({"unreferenced": True})
+        self.assertEqual(update.macho_entitlements(binary), {})
+
+    def test_reads_xml_on_both_endiannesses_and_word_sizes(self):
+        expected = {"get-task-allow": True, "example.groups": ["one", "two"]}
+        for endian in ("<", ">"):
+            for is_64 in (False, True):
+                with self.subTest(endian=endian, is_64=is_64):
+                    self.assertEqual(update.macho_entitlements(thin_fixture(expected, endian=endian, is_64=is_64)), expected)
+
+    def test_reads_bundle_executable_without_platform_tools(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary)
+            (bundle / "Info.plist").write_bytes(plistlib.dumps({"CFBundleExecutable": "Kodi"}))
+            (bundle / "Kodi").write_bytes(thin_fixture({"example": True}))
+            with mock.patch.object(update.subprocess, "run", side_effect=AssertionError("platform tool invoked")):
+                self.assertEqual(update.read_entitlements(bundle), {"example": True})
+
+    def test_merges_all_fat_slices_with_relative_signature_offsets(self):
+        for is_64 in (False, True):
+            binary = fat_fixture([thin_fixture({"first": True}), thin_fixture({"second": ["value"]})], is_64=is_64)
+            self.assertEqual(update.macho_entitlements(binary), {"first": True, "second": ["value"]})
+
+    def test_rejects_conflicting_architecture_entitlements(self):
+        binary = fat_fixture([thin_fixture({"example": True}), thin_fixture({"example": False})])
+        with self.assertRaisesRegex(update.UpdateError, "Conflicting"):
+            update.macho_entitlements(binary)
+
+    def test_rejects_der_only_instead_of_silently_omitting(self):
+        binary = thin_fixture(signature=signature_fixture([(7, 0xFADE7172, b"DER")]))
+        with self.assertRaisesRegex(update.UpdateError, "DER-only"):
+            update.macho_entitlements(binary)
+
+    def test_signature_without_entitlements_is_empty(self):
+        binary = thin_fixture(signature=signature_fixture([(2, 0xFADE0C01, b"requirements")]))
+        self.assertEqual(update.macho_entitlements(binary), {})
+
+    def test_rejects_malformed_xml_and_superblob_indices(self):
+        bad_xml = thin_fixture(signature=signature_fixture([(5, 0xFADE7171, b"not an XML plist")]))
+        bad_index = bytearray(signature_fixture([(5, 0xFADE7171, plistlib.dumps({"x": True}))]))
+        struct.pack_into(">I", bad_index, 16, 0xFFFFFFF0)
+        for binary in (bad_xml, thin_fixture(signature=bad_index)):
             with self.assertRaises(update.UpdateError):
-                update.read_entitlements(Path("Kodi.app"))
+                update.macho_entitlements(binary)
+
+    def test_rejects_signature_range_outside_slice_and_truncated_load_command(self):
+        bad_range = bytearray(thin_fixture({"x": True}))
+        struct.pack_into("<I", bad_range, 40, len(bad_range) + 1)
+        bad_command = bytearray(thin_fixture({"x": True}))
+        struct.pack_into("<I", bad_command, 36, 4)
+        for binary in (bad_range, bad_command, b"\xcf\xfa\xed\xfe", b"unknown"):
+            with self.assertRaises(update.UpdateError):
+                update.macho_entitlements(binary)
 
 
 class FeedTests(unittest.TestCase):
