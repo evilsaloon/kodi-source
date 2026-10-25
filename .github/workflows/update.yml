@@ -49,16 +49,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          extra_args=()
+          args=(
+            --repository "$GITHUB_REPOSITORY"
+            --output-dir build
+            --existing-source source.json
+            --state state.json
+          )
           if [[ "$FORCE_REBUILD" == "true" ]]; then
-            extra_args+=(--force)
+            args+=(--force)
           fi
-          python scripts/update.py \
-            --repository "$GITHUB_REPOSITORY" \
-            --output-dir build \
-            --existing-source source.json \
-            --state state.json \
-            "${extra_args[@]}"
+          python scripts/update.py "${args[@]}"
 
       - name: Publish release assets before changing the feed
         shell: python
